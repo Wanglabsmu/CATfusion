@@ -1,0 +1,384 @@
+from lifelines.statistics import logrank_test
+from sksurv.metrics import cumulative_dynamic_auc
+from sksurv.datasets import load_veterans_lung_cancer
+from sksurv.nonparametric import kaplan_meier_estimator
+from pathlib import Path
+import os
+import sys
+os.chdir(sys.path[0])  # NOQA: E402
+sys.path.append(os.getcwd())  # NOQA: E402
+
+import math
+import argparse
+import time
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+import torch.optim as optim
+import torch.optim.lr_scheduler as lr_scheduler
+from tensorboardX import SummaryWriter
+from torchvision import transforms
+from my_datasets import MyDataSet
+from models.modeling_CATfusion import CATfusion, CONFIGS  # NOQA: E402
+from utils import read_split_data, train_one_epoch, evaluate, write_pickle
+
+import glob
+import pandas as pd
+import h5py
+from collections import OrderedDict
+from sklearn.preprocessing import LabelEncoder
+from tqdm import tqdm
+from models.model_utils import CIndex_lifeline, cox_log_rank, accuracy_cox, CIndex
+import pickle as pkl
+os.environ['CUDA_DEVICE_ORDER'] = "PCI_BUS_ID"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
+
+def clean_ax(ax, clean_all: bool = False, inverted: bool = False):
+    """
+    Cleans the borders of a matplotlib.axis object.
+    Parameters
+    ----------
+    ax: matplotlib.axis
+        axis object to be modified
+    clean_all: boolean (default = False)
+        whether to clean the entire boundary
+    inverted: boolean (default = False)
+        whether to clean bottom and right borders
+    """
+    if clean_all:
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.spines['left'].set_visible(False)
+        ax.spines['bottom'].set_visible(False)
+    elif inverted:
+        ax.spines['bottom'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+    else:
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+    return ax
+
+
+def main(args):
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+
+    svs_files_omics_files_mapping_dirpath = os.path.join(
+        "/home/huyongfei/PycharmProjects/VLP_wsi_RNAseq/wsi_omics_fusion/CATfusion_classification_cancer_type", "output_"+args.omics_names_flag)
+    svs_files_omics_files_mapping_files = [
+        "svs_input_for_train_dataframe.tsv", "svs_input_for_val_dataframe.tsv"]
+    svs_files_omics_files_mapping = []
+    for ele in svs_files_omics_files_mapping_files:
+        tmp = pd.read_csv(os.path.join(
+            svs_files_omics_files_mapping_dirpath, ele), header=0, sep="\t")
+        svs_files_omics_files_mapping.append(tmp)
+    svs_files_omics_files_mapping = pd.concat(
+        svs_files_omics_files_mapping, axis=0)
+    print(args.omics_names_flag, "svs files omics files mapping records size:",
+          svs_files_omics_files_mapping.shape[0])
+
+    svs_records_merge_annotation = svs_files_omics_files_mapping
+    svs_records_merge_annotation["simple_sample_name"] = [
+        ele[:12] for ele in svs_records_merge_annotation["sample_name"]]
+
+    # 给每个svs加上PFI(progression_fress_interval)相关数据
+    svs_recoreds_pathologic_data_all = pd.read_csv(
+        "/home/huyongfei/PycharmProjects/VLP_wsi_RNAseq/WSI_classification_progression_free_interval/TCGA_ctranspath_patch_feature_AttMIL/2018_recommend_progression_free_interval.txt", header=0, sep="\t", index_col="id")
+    svs_recoreds_pathologic_data = svs_recoreds_pathologic_data_all.loc[:, [
+        "bcr_patient_barcode", "PFI", "PFI.time"]]
+
+    # 对PFI进行筛选，确保有值（包含PFI,PFI.time两个值要同时保证有值）
+    svs_recoreds_pathologic_data = svs_recoreds_pathologic_data.dropna(axis=0)
+
+    # ['file_id', 'svs_id', 'barcode', 'size', 'file_status', 'dataset_name', 'sample_name', 'vqvae_feature_path', 'simple_sample_name', 'bcr_patient_barcode', 'PFI', 'PFI.time']
+    svs_records_add_PFI_annotation = pd.merge(
+        left=svs_records_merge_annotation, right=svs_recoreds_pathologic_data, left_on="simple_sample_name", right_on="bcr_patient_barcode", how="inner")
+
+    omics_feature_path_dict = {
+        "rna_seq": "/home/huyongfei/PycharmProjects/PublicCode/self_reproduce/NLP/CIForm_MAE/single_omic_training/outputRNA-Seq/len_feature_result.h5",
+        "mirna_seq": "/home/huyongfei/PycharmProjects/PublicCode/self_reproduce/NLP/CIForm_MAE/single_omic_training/outputmiRNA-Seq/len_feature_result.h5",
+        "copynumbervariation": "/home/huyongfei/PycharmProjects/PublicCode/self_reproduce/NLP/CIForm_MAE/single_omic_training/outputCopyNumberVariation/len_feature_result.h5",
+        "dnamethylationvariation": "/home/huyongfei/PycharmProjects/PublicCode/self_reproduce/NLP/CIForm_MAE/single_omic_training/outputDNAMethylationVariation/len_feature_result.h5",
+        "snp": "/home/huyongfei/PycharmProjects/PublicCode/self_reproduce/NLP/CIForm_MAE/single_omic_training/outputSNP/len_feature_result.h5",
+    }
+
+    omics_feature_samplename_dict = OrderedDict()
+    for omic in args.omics_names:
+        with h5py.File(omics_feature_path_dict[omic], 'r') as hf:
+            features = np.array(hf['features'][:], dtype=np.float32)
+            samplenames = np.array(hf['samplenames'][:])
+            # print(samplenames[:5])
+            omics_feature_samplename_dict[omic] = {"features": features,
+                                                   "samplenames": samplenames}
+
+    # 对齐一下patch feature,omics feature的sample name
+    svs_input_for_model_df = svs_records_add_PFI_annotation
+    print(args.omics_names_flag, "for train survival predict records size:",
+          svs_input_for_model_df.shape)
+
+    dataset_le = LabelEncoder()
+    svs_input_for_model_df["dataset_id"] = dataset_le.fit_transform(
+        np.array(svs_input_for_model_df["dataset_name"]))
+    dataset_mapping = pd.DataFrame({
+        "dataset_name": dataset_le.classes_,
+        "dataset_id": list(range(len(dataset_le.classes_)))
+    })
+
+    omics_feature_for_train_dict = OrderedDict()
+    for omic in args.omics_names:
+        tmp_omic_samplenames = list(
+            [ele.decode() for ele in omics_feature_samplename_dict[omic]["samplenames"]])
+        tmp_omic_sample_index = [tmp_omic_samplenames.index(
+            ele.split("'")[1]) for ele in svs_input_for_model_df[omic+"-selected_samples"]]
+        omics_feature_for_train_dict[omic] = omics_feature_samplename_dict[omic]["features"][tmp_omic_sample_index]
+        print(omic, "feature size", omics_feature_for_train_dict[omic].shape)
+
+    mydataset = MyDataSet(
+        patch_feature_filepaths=list(
+            svs_input_for_model_df["patch_feature_filepath"]),
+        patch_survtimes=list(svs_input_for_model_df["PFI.time"]),
+        patch_censors=list(svs_input_for_model_df["PFI"]),
+        omics_features_dict=omics_feature_for_train_dict
+    )
+
+    batch_size = args.batch_size
+    # number of workers
+    nw = min([os.cpu_count(), batch_size if batch_size > 1 else 0, 8])
+    print('Using {} dataloader workers every process'.format(nw))
+
+    val_loader = torch.utils.data.DataLoader(mydataset,
+                                             batch_size=batch_size,
+                                             shuffle=False,
+                                             pin_memory=True,
+                                             num_workers=nw,
+                                             collate_fn=mydataset.collate_fn)
+    print("val_loader", len(val_loader.dataset))
+
+    print("="*72)
+    # "rna_seq", "mirna_seq", "copynumbervariation", "dnamethylationvariation", "snp"
+    config = CONFIGS["CATfusion"]
+    print("config", config)
+    # 这里是做生存预测的所以num_classes=1
+
+    K = 5
+    for iter_k in range(K):
+        output_dir = os.path.join(
+            args.five_fold_cross_validation_result_dirpath, str(iter_k)+"_fold")
+        print("output_dir", output_dir)
+
+        model_weights = os.path.join(
+            output_dir, "weights", "model_checkpoint_best.pth")
+        # 导入训练的权重
+        model = CATfusion(config, zero_head=True,
+                      num_classes=1)
+        model.load_state_dict(torch.load(model_weights,
+                              map_location="cpu"), strict=False)
+
+        model = model.to(device)
+
+        model.eval()
+
+        accu_loss = 0.0  # 累计损失
+
+        sample_num = 0
+
+        omics_lens_dict = {
+            "rna_seq": 10,
+            "mirna_seq": 2,
+            "copynumbervariation": 27,
+            "dnamethylationvariation": 8,
+            "snp": 10,
+        }
+
+        risk_pred_all, censor_all, survtime_all = np.array(
+            []), np.array([]), np.array([])
+        transformer_output_all = []
+
+        with torch.no_grad():
+            val_loader = tqdm(val_loader, file=sys.stdout)
+            for step, data in enumerate(val_loader):
+                patch_feaure, omics_feature, survtime, censor = data
+
+                sample_num += patch_feaure.shape[0]
+                patch_feaure = patch_feaure.to(device)
+                survtime = (survtime.float()).to(device)
+                censor = (censor.float()).to(device)
+
+                omics_input_dict = OrderedDict()
+                start_index = 0
+                stop_index = 0
+                for omic in args.omics_names:
+                    stop_index = start_index+omics_lens_dict[omic]
+                    omics_input_dict[omic] = (omics_feature[:,
+                                                            start_index:stop_index, :]).to(device)
+                    start_index = stop_index
+
+                loss, pred, transformer_output = model(
+                    patch_feaure, omics_input_dict, survtime, censor)
+
+                accu_loss += loss.item()
+
+                risk_pred_all = np.concatenate(
+                    (risk_pred_all, pred.detach().cpu().numpy().reshape(-1)))
+                censor_all = np.concatenate(
+                    (censor_all, censor.detach().cpu().numpy().reshape(-1)))
+                survtime_all = np.concatenate(
+                    (survtime_all, survtime.detach().cpu().numpy().reshape(-1)))
+                transformer_output_all.append(
+                    transformer_output.detach().cpu().numpy())
+
+        print("accu_loss", accu_loss/sample_num)
+        cindex_test = CIndex(risk_pred_all, censor_all, survtime_all)
+        cindex_lifeline_test = CIndex_lifeline(
+            risk_pred_all, censor_all, survtime_all)
+        pvalue_test = cox_log_rank(risk_pred_all, censor_all, survtime_all)
+        surv_acc_test = accuracy_cox(risk_pred_all, censor_all)
+        # pred_test = [risk_pred_all, survtime_all, censor_all]
+
+        print("cindex_test:", cindex_test)
+        print("cindex_lifeline_test:", cindex_lifeline_test)
+        print("pvalue_test", pvalue_test)
+        print("surv_acc_test", surv_acc_test)
+        transformer_output_all = np.concatenate(transformer_output_all, axis=0)
+        print("transformer_output_all", transformer_output_all.shape)
+        # np.save(os.path.join(output_dir, "transformer_output_all.npy"),
+        #         transformer_output_all)
+
+        print("TEST RANK", np.sum(survtime_all ==
+              svs_input_for_model_df["PFI.time"].values))
+        # survival_time的排列顺序一致得出val_dataloader(shuffle=False)是好使的，完全没有改变输入的顺序
+
+        svs_input_for_model_df["pred_hazard"] = risk_pred_all
+
+        # with open(os.path.join(output_dir, 'model_best_weights_criteria.tsv'), 'w') as f_out:
+        #     f_out.write("cindex_test"+"\t"+str(cindex_test)+"\n")
+        #     f_out.write("cindex_lifeline_test"+"\t"+str(cindex_lifeline_test)+"\n")
+        #     f_out.write("cox_log_rank"+"\t"+str(pvalue_test)+"\n")
+        #     f_out.write("accuracy_cox"+"\t"+str(surv_acc_test)+"\n")
+
+        # with open(os.path.join(output_dir, 'model_best_weights_transformer_output_all.pkl'), 'wb') as f:
+        #     pkl.dump({'patient_fusion_features': transformer_output_all,
+        #               'metadata': svs_input_for_model_df}, f, pkl.HIGHEST_PROTOCOL)
+
+        # 统计各个癌型上的评价指标
+        cindex_test_list = []
+        pvalue_test_list = []
+        surv_acc_test_list = []
+        stat_names = []
+        cindex_lifeline_test_list = []
+        cindex_test_list.append(cindex_test)
+        cindex_lifeline_test_list.append(cindex_lifeline_test)
+        pvalue_test_list.append(pvalue_test)
+        surv_acc_test_list.append(surv_acc_test)
+        stat_names.append("whole_TCGA")
+
+        for dataset in np.unique(svs_input_for_model_df["dataset_name"]):
+            tmp_svs_input_for_model_df = svs_input_for_model_df[
+                svs_input_for_model_df["dataset_name"] == dataset]
+            tmp_cindex_test = CIndex(
+                np.array(tmp_svs_input_for_model_df["pred_hazard"]), np.array(tmp_svs_input_for_model_df["PFI"]), np.array(tmp_svs_input_for_model_df["PFI.time"]))
+            tmp_cindex_lifeline_test = CIndex_lifeline(
+                np.array(tmp_svs_input_for_model_df["pred_hazard"]), np.array(tmp_svs_input_for_model_df["PFI"]), np.array(tmp_svs_input_for_model_df["PFI.time"]))
+
+            tmp_pvalue_test = cox_log_rank(np.array(tmp_svs_input_for_model_df["pred_hazard"]), np.array(
+                tmp_svs_input_for_model_df["PFI"]), np.array(tmp_svs_input_for_model_df["PFI.time"]))
+            tmp_surv_acc_test = accuracy_cox(np.array(
+                tmp_svs_input_for_model_df["pred_hazard"]), np.array(tmp_svs_input_for_model_df["PFI"]))
+            cindex_test_list.append(tmp_cindex_test)
+            cindex_lifeline_test_list.append(tmp_cindex_lifeline_test)
+            pvalue_test_list.append(tmp_pvalue_test)
+            surv_acc_test_list.append(tmp_surv_acc_test)
+            stat_names.append(dataset)
+
+        per_cancer_type_model_criteria_df = pd.DataFrame({
+            "dataset_name": stat_names,
+            "CIndex_value": cindex_test_list,
+            "CIndex_lifeline_value": cindex_lifeline_test_list,
+            "cox_log_rank_p_value": pvalue_test_list,
+            "accuracy_cox": surv_acc_test_list
+        })
+        per_cancer_type_model_criteria_df.to_csv(os.path.join(
+            output_dir, 'model_best_weights_per_cancer_type_criteria.tsv'), sep="\t", header=True, index=False)
+
+        svs_input_for_model_df.to_csv(os.path.join(
+            output_dir, 'model_best_weights_pred_hazard.tsv'), sep="\t", header=True, index=False)
+
+        ##############################################################################################
+        median_risk = np.median(svs_input_for_model_df['pred_hazard'])
+        svs_input_for_model_df['patient_risk_group'] = [
+            "high_risk" if ele > median_risk else "low_risk" for ele in svs_input_for_model_df['pred_hazard']]
+        x_standard, y_standard = kaplan_meier_estimator(svs_input_for_model_df['PFI'][svs_input_for_model_df['patient_risk_group'] == 'low_risk'].astype(
+            bool), svs_input_for_model_df['PFI.time'][svs_input_for_model_df['patient_risk_group'] == 'low_risk'])
+        x_test, y_test = kaplan_meier_estimator(svs_input_for_model_df['PFI'][svs_input_for_model_df['patient_risk_group'] == 'high_risk'].astype(
+            bool), svs_input_for_model_df['PFI.time'][svs_input_for_model_df['patient_risk_group'] == 'high_risk'])
+
+        results = logrank_test(svs_input_for_model_df['PFI.time'][svs_input_for_model_df['patient_risk_group'] == 'low_risk'], svs_input_for_model_df['PFI.time'][svs_input_for_model_df['patient_risk_group'] == 'high_risk'],
+                               event_observed_A=svs_input_for_model_df['PFI'][svs_input_for_model_df['patient_risk_group'] == 'low_risk'], event_observed_B=svs_input_for_model_df['PFI'][svs_input_for_model_df['patient_risk_group'] == 'high_risk'])
+
+        results.print_summary()
+
+        print("y_standard", y_standard[:5])
+        f, ax = plt.subplots(dpi=120, figsize=(5, 4))
+        # Standard treatment by age
+        ax.step(x_standard, y_standard, where="post", label='low_risk')
+        ax.step(x_test, y_test, where="post", label='high_risk')
+        ax.set_ylim(0, 1)
+        clean_ax(ax)
+        ax.set_ylabel(r'$\hat{S}_{KM}(t)$')
+        ax.set_xlabel('PFI.time [days] {0:.5f}'.format(results.p_value))
+        ax.set_title(
+            'Kaplan-Meier estimate by pred hazard + log rank test p-value=')
+        ax.legend(loc='best', frameon=False)
+        plt.savefig(os.path.join(
+            output_dir, 'model_best_weights_pred_hazard_KM_plot.pdf'))
+
+        print("lifelines log rank test p value",
+              results.p_value)        # 0.7676
+        print("lifelines log rank test test statistic",
+              results.test_statistic)  # 0.0872
+
+        va_x, va_y = load_veterans_lung_cancer()
+
+        cumulative_dynamic_auc_y_data = list(zip(svs_input_for_model_df["PFI"].astype(
+            bool), svs_input_for_model_df["PFI.time"]))
+        cumulative_dynamic_auc_y_data = np.array(
+            cumulative_dynamic_auc_y_data, dtype=va_y.dtype)
+        print("cumulative_dynamic_auc_y_data",
+              cumulative_dynamic_auc_y_data[:5])
+        va_times = np.arange(1, 8000, 200)
+
+        cph_auc, cph_mean_auc = cumulative_dynamic_auc(
+            cumulative_dynamic_auc_y_data, cumulative_dynamic_auc_y_data, svs_input_for_model_df["pred_hazard"], va_times)
+        f, ax = plt.subplots(dpi=120)
+        ax.plot(va_times, cph_auc, marker="o")
+        ax.axhline(cph_mean_auc, linestyle="--")
+        ax.set_xlabel("days from enrollment")
+        ax.set_ylabel("time-dependent AUC")
+        ax.grid(False)
+        ax.set_title(
+            'Model: Time dependence of performance, cph_mean_auc={0:.5f}'.format(cph_mean_auc))
+        clean_ax(ax)
+        plt.savefig(os.path.join(
+            output_dir, "model_best_weights_pred_hazard_cumulative_dynamic_auc_plot.pdf"))
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--epochs', type=int, default=1)
+    parser.add_argument('--batch-size', type=int, default=64)
+
+    # "rna_seq", "mirna_seq", "copynumbervariation", "dnamethylationvariation", "snp"
+    parser.add_argument('--omics_names_flag', type=str, default="rna_seq-mirna_seq-copynumbervariation-dnamethylationvariation-snp",
+                        help='the omics name use to train model')
+
+    parser.add_argument('--five_fold_cross_validation_result_dirpath', type=str,
+                        default="")
+
+    parser.add_argument('--device', default='cuda:0',
+                        help='device id (i.e. 0 or 0,1 or cpu)')
+
+    opt = parser.parse_args()
+
+    opt.omics_names = opt.omics_names_flag.split(
+        "-") if "-" in opt.omics_names_flag else [opt.omics_names_flag]
+    main(opt)
